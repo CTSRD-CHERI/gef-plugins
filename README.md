@@ -13,5 +13,8 @@ echo gef config gef.extra_plugins_dir gef-plugins >> ~/.gdbinit
     - `jheap chunk <address>`
 - Scan for freed heap chunks that are pointed by valid capabilities in memory. Optionally, exclude capabilities stored in the heap.
     - `jheap uaf [noheap]`
-- Scan memory for valid capabilities stored in `source` and pointing to `destination`. 
-    - `scancaps [source] [destination]` 
+
+## TODO
+
+- More Jemalloc heap commands, like `chunks`, `bins`, `arenas`.
+- Snmalloc?
