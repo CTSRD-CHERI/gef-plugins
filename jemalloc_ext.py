@@ -359,7 +359,10 @@ class JemallocChunk:
             if self.free_in_slab():
                 return ChunkState.FREE_SLAB
         else:
-            if jemalloc.find_in_free_extents(self.addr):
+            # 1 for dirty, 2 for muzzy, 3 for retained
+            # all 3 mean not in use, see extent_state_t
+            # in extent_structs.h
+            if (int(self.extent['e_bits']) >> 16) & 0b11 > 0:
                 return ChunkState.FREE_EXTENT
         return ChunkState.USED
 
