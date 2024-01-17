@@ -433,7 +433,7 @@ class JemallocHeapCommand(GenericCommand):
     """Base command to get information about the Jemalloc heap structure."""
 
     _cmdline_ = "jheap"
-    _syntax_  = f"{_cmdline_} (chunk|uaf)"
+    _syntax_  = f"{_cmdline_} (chunk|uaf|chunks)"
 
     def __init__(self) -> None:
         super().__init__(prefix=True)
@@ -569,3 +569,53 @@ class JemallocUAFCommand(GenericCommand, ScanCapsBase):
             and (not noheap or section.path != "[heap]")
         ]
         self.scan_memory(src, [(self.heap.page_start, self.heap.page_end)])
+
+@register
+class JemallocChunksCommand(GenericCommand):
+    """placeholder"""
+
+    _cmdline_ = "jheap chunks"
+    _syntax_  = f"{_cmdline_} [-h]"
+
+    def __init__(self) -> None:
+        super().__init__(complete=gdb.COMPLETE_NONE)
+        self.peek_nb_byte = 16
+        return
+
+    @only_if_gdb_running
+    def do_invoke(self, argv: List[str], **kwargs: Any) -> None:
+        in_use = []
+        for section in gef.memory.maps:
+            if section.path == '[heap]':
+                curr = section.page_start
+                while curr < section.page_end:
+                    chunk = JemallocChunk(curr)
+                    extent_sz = int(chunk.extent['e_bsize'])
+                    if chunk.is_small():
+                        # Chunk is small, so a region in a slab
+                        # We now have to check the bitmap of the slab
+                        bitmap_idx = -1
+                        idx = 0
+                        bitmap_val = 0
+                        chunk_sz = chunk.size
+                        region_cnt = extent_sz / chunk_sz
+                        # If there's a 0 in the position in the bitmap,
+                        # the chunk may not really be in use as it can be inside the tcache
+                        # We need to double check
+                        while idx < region_cnt:
+                            if idx % 64 == 0:
+                                bitmap_idx += 1
+                                bitmap_val = int(chunk.extent['e_slab_data']['bitmap'][bitmap_idx])
+                            if bitmap_val & (1 << (idx % 64)) == 0:
+                                region_chunk = JemallocChunk(curr + idx * chunk_sz)
+                                if region_chunk.get_chunk_status() == ChunkState.USED:
+                                    in_use.append(region_chunk)
+                            idx += 1
+                    else:
+                        if chunk.get_chunk_status() == ChunkState.USED:
+                            in_use.append(chunk)
+                    curr += extent_sz
+        for chunk in in_use:
+            print(chunk)
+            base = chunk.base_addr
+            print(f"    [{hexdump(gef.memory.read(base, self.peek_nb_byte), self.peek_nb_byte, base=base, align = 18)}]")
