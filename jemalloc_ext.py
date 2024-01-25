@@ -8,7 +8,7 @@ Where can free chunks end up:
 - slab (small)
 - free extents (large, or small if their extent is freed)
 - free extents, coalesced
-
+- quarantine (in CheriBSD, if caprevoke is enabled)
 '''
 
 from enum import Enum
@@ -28,6 +28,7 @@ class ChunkState(Enum):
     FREE_SLAB = 3              # In slab
     FREE_EXTENT = 4            # In one of the extents in an arena
     FREE_EXTENT_COALESCED = 5  # Same as before, but coalesced
+    FREE_QUARANTINE = 6        # In caprevoke quarantine
 
 
 def read_captags(addr, length):
@@ -270,12 +271,58 @@ class GefJemallocManager(GefManager):
     def max_tcache_idx(self):
         return int(gdb.parse_and_eval('__je_nhbins'))
     
+class GefHeapQuarantineManager(GefManager):
+    """Class managing heap quarantine."""
+    def __init__(self) -> None:
+        self.reset_caches()
+        return
+
+    def reset_caches(self) -> None:
+        super().reset_caches()
+        self.__read_chunks()
+        return
+
+    def __read_chunks(self) -> None:
+        self.__chunks = set() # Set of chunks in quarantine
+        self.__has_quarantine = False
+        try:
+            app_quarantine = gdb.parse_and_eval('application_quarantine')
+        except:
+            app_quarantine = None
+        if app_quarantine:
+            self.__has_quarantine = True
+            curr = app_quarantine['list']
+            while int(curr) != 0:
+                num_desc = curr['num_descriptors']
+                # for i in range(num_desc):
+                #     self.__chunks.add(int(curr['slab'][i]['ptr']))
+
+                # Single read optimisation
+                desc_sz = curr['slab'][0].type.sizeof
+                data = gef.memory.read(curr['slab'], num_desc * desc_sz)
+                self.__chunks = {
+                    u64(data[i * desc_sz:i * desc_sz + 8])
+                    for i in range(num_desc)
+                }
+                curr = curr['next']
+
+    @property
+    def chunks(self):
+        return self.__chunks
+
+    @property
+    def has_quarantine(self):
+        return self.__has_quarantine
+    
+
 jemalloc = GefJemallocManager()
+quarantine = GefHeapQuarantineManager()
 
 # Hooking
 orig_reset_fn = gef.heap.reset_caches
 def hooked_reset():
     jemalloc.reset_caches()
+    quarantine.reset_caches()
     orig_reset_fn()
 gef.heap.reset_caches = hooked_reset
 gef.memory.read_captags = read_captags # hack
@@ -353,6 +400,8 @@ class JemallocChunk:
         return (bitmap & (1 << j)) != 0
     
     def get_chunk_status_(self):
+        if self.base_addr in quarantine.chunks:
+            return ChunkState.FREE_QUARANTINE
         if self.in_tcache():
             return ChunkState.FREE_TCACHE
         if self.is_small():
@@ -382,6 +431,10 @@ class JemallocChunk:
         return (f"{Color.colorify('Chunk', 'yellow bold underline')}(addr={self.base_addr:#x}, "
                 f"size={self.size:#x} ({size}), status={self.is_free_msg()})")
 
+    def quarantine_msg(self) -> str:
+        status = Color.colorify('Yes', 'green') if self.__info['status'] == ChunkState.FREE_QUARANTINE else Color.colorify('No', 'red')
+        return f'In quarantine: {status}'
+
     def tcache_msg(self) -> str:
         status = Color.colorify('Yes', 'green') if self.__info['status'] == ChunkState.FREE_TCACHE else Color.colorify('No', 'red')
         return f'In tcache: {status}'
@@ -401,6 +454,8 @@ class JemallocChunk:
         if self.__info['status'] == ChunkState.USED:
             pass
         else:
+            if quarantine.has_quarantine:
+                msg.append(self.quarantine_msg())
             msg.append(self.tcache_msg())
         msg.append(self.extent_info())
         # else:
@@ -575,7 +630,7 @@ class JemallocUAFCommand(GenericCommand, ScanCapsBase):
 
 @register
 class JemallocChunksCommand(GenericCommand):
-    """placeholder"""
+    """Show all the chunks in USED state."""
 
     _cmdline_ = "jheap chunks"
     _syntax_  = f"{_cmdline_} [-h]"
