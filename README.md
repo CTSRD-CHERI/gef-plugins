@@ -20,4 +20,6 @@ echo gef config gef.extra_plugins_dir gef-plugins >> ~/.gdbinit
 ## TODO
 
 - More Jemalloc heap commands, like `arena(s)`, `extent(s)`, `tcache`, `slab(s)`
+- List quarantined chunks, like `jheap quarantine chunks` (the quarantine is not tied to jemalloc manager right?)
 - Snmalloc?
+- PartitionAlloc?
