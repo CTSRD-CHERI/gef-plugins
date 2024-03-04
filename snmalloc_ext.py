@@ -7,9 +7,21 @@
 # TODO: exception handling (extremely lacking)
 # TODO: test on morello
 # TODO: test as a shim and as the main allocator
+# TODO: improve UX
 
 from __future__ import annotations
 from enum import Enum
+
+# strings to query in GDB
+SNMALLOC_PAL = "snmalloc::PALLinux"
+SNMALLOC_PAGEMAP = "snmalloc::BasicPagemap"
+SNMALLOC_CONCRETE_PAGEMAP = "snmalloc::FlatPagemap"
+SNMALLOC_PAGEMAP_ENTRY = "snmalloc::DefaultPagemapEntryT"
+SNMALLOC_SLABMETADATA = "snmalloc::DefaultSlabMetadata"
+SNMALLOC_FLATPAGEMAP_HASBOUNDS = "false"
+SNMALLOC_BASICPAGEMAP_FIXEDRANGE = "false"
+SNMALLOC_CONFIG = "snmalloc::StandardConfig"  # XXXR3: there could be allocators of different configs within the same program?
+
 
 def from_exp_mant(m_e: int, mantissa_bits: int, low_bits: int):
     if mantissa_bits > 0:
@@ -99,20 +111,17 @@ class GefSnmallocHeapManager(GefManager):
     def pagemap_body(self) -> Optional[int]:
         if not self.__pagemap_body:
             try:
-                self.__pagemap_body = GefSnmallocHeapManager.find_pagemap_body()
+                self.__pagemap_body = self.find_pagemap_body()
             except:
                 pass
         return self.__pagemap_body
     
-    @staticmethod
-    def find_pagemap_body() -> int:
+    def find_pagemap_body(self) -> int:
         """Find the Pagemap body."""
-        # TODO: coupled with Linux!
-        pagemap_body = parse_address("'snmalloc::BasicPagemap<snmalloc::PALLinux, snmalloc::FlatPagemap<14ul, snmalloc::DefaultPagemapEntryT<snmalloc::DefaultSlabMetadata>, snmalloc::PALLinux, false>, snmalloc::DefaultPagemapEntryT<snmalloc::DefaultSlabMetadata>, false>::concretePagemap'->body")
+        pagemap_body = parse_address(f"'{SNMALLOC_PAGEMAP}<{SNMALLOC_PAL}, {SNMALLOC_CONCRETE_PAGEMAP}<{self.min_chunk_bits}ul, {SNMALLOC_PAGEMAP_ENTRY}<{SNMALLOC_SLABMETADATA}>, {SNMALLOC_PAL}, {SNMALLOC_FLATPAGEMAP_HASBOUNDS}>, {SNMALLOC_PAGEMAP_ENTRY}<{SNMALLOC_SLABMETADATA}>, {SNMALLOC_BASICPAGEMAP_FIXEDRANGE}>::concretePagemap'->body")
         return pagemap_body
     
-    @staticmethod
-    def find_localalloc_addr() -> Optional[int]:
+    def find_localalloc_addr(self) -> Optional[int]:
         """Find the address of the current thread's LocalAlloc."""
         try:
             localalloc_addr = parse_address("&'snmalloc::ThreadAlloc::get()::alloc'")
@@ -439,19 +448,19 @@ class SlabMetadata:
     @property
     def needed(self) -> int:
         if not self.__needed:
-            self.__needed = parse_address(f"(*('snmalloc::DefaultSlabMetadata'*){self.address})->needed_")
+            self.__needed = parse_address(f"(*('{SNMALLOC_SLABMETADATA}'*){self.address})->needed_")
         return self.__needed
     
     @property
     def sleeping(self) -> bool:
         if not self.__sleeping:
-            self.__sleeping = parse_address(f"(*('snmalloc::DefaultSlabMetadata'*){self.address})->sleeping_") != 0
+            self.__sleeping = parse_address(f"(*('{SNMALLOC_SLABMETADATA}'*){self.address})->sleeping_") != 0
         return self.__sleeping
     
     @property
     def large(self) -> bool:
         if not self.__large:
-            self.__large = parse_address(f"(*('snmalloc::DefaultSlabMetadata'*){self.address})->large_") != 0
+            self.__large = parse_address(f"(*('{SNMALLOC_SLABMETADATA}'*){self.address})->large_") != 0
         return self.__large
     
     def __str__(self) -> str:
@@ -575,7 +584,7 @@ class CoreAlloc:
         if not self.__alloc_classes:
             try:
                 self.__alloc_classes = [None for _ in range(snmallocheap.num_small_sizeclasses)]
-                array_base = parse_address(f"&(*('snmalloc::CoreAllocator<snmalloc::StandardConfig>'*){self.address:#x})->alloc_classes")
+                array_base = parse_address(f"&(*('snmalloc::CoreAllocator<{SNMALLOC_CONFIG}>'*){self.address:#x})->alloc_classes")
                 for i in range(snmallocheap.num_small_sizeclasses):
                     cache_struct_base = array_base + i * self.SlabMetadataCache.sizeof()
                     head = SeqSet(cache_struct_base)
@@ -592,7 +601,7 @@ class CoreAlloc:
     def laden(self) -> SeqSet:
         if not self.__laden:
             try:
-                laden_base = parse_address(f"&(*('snmalloc::CoreAllocator<snmalloc::StandardConfig>'*){self.address:#x})->laden")
+                laden_base = parse_address(f"&(*('snmalloc::CoreAllocator<{SNMALLOC_CONFIG}>'*){self.address:#x})->laden")
                 self.__laden = SeqSet(laden_base)
             except gdb.error:
                 print("UNIMPLEMENTED")
@@ -606,7 +615,7 @@ class CoreAlloc:
     def remote_alloc(self):
         # TODO: assuming queue is inline, so RemoteAllocator and not RemoteAllocator*
         if not self.__remote_alloc:
-            self.__remote_alloc = RemoteAllocator(parse_address(f"&(*('snmalloc::CoreAllocator<snmalloc::StandardConfig>'*){self.address:#x})->remote_alloc"))
+            self.__remote_alloc = RemoteAllocator(parse_address(f"&(*('snmalloc::CoreAllocator<{SNMALLOC_CONFIG}>'*){self.address:#x})->remote_alloc"))
         return self.__remote_alloc
 
 
@@ -772,7 +781,7 @@ class SnmallocHeapCommand(GenericCommand):
     """Base command to get information about the snmalloc heap structure."""
 
     _cmdline_ = "snheap"
-    _syntax_  = f"{_cmdline_} (localcache|slabs|remote|freelists|chunk)"
+    _syntax_  = f"{_cmdline_} (info|localcache|slabs|remote|freelists|chunk)"
 
     def __init__(self) -> None:
         super().__init__(prefix=True)
@@ -818,7 +827,7 @@ class SnmallocHeapLocalcacheCommand(GenericCommand):
                 continue
             thread.switch()
 
-            localalloc_addr = GefSnmallocHeapManager.find_localalloc_addr()
+            localalloc_addr = snmallocheap.find_localalloc_addr()
             if localalloc_addr == 0:
                 info(f"Uninitialized LocalAlloc for thread {thread.num:d}")
                 continue
@@ -862,7 +871,7 @@ class SnmallocHeapSlabsCommand(GenericCommand):
                 continue
             thread.switch()
 
-            localalloc_addr = GefSnmallocHeapManager.find_localalloc_addr()
+            localalloc_addr = snmallocheap.find_localalloc_addr()
             if localalloc_addr == 0:
                 info(f"Uninitialized LocalAlloc for thread {thread.num:d}")
                 continue
@@ -955,7 +964,7 @@ class SnmallocHeapRemoteCommand(GenericCommand):
                 continue
             thread.switch()
 
-            localalloc_addr = GefSnmallocHeapManager.find_localalloc_addr()
+            localalloc_addr = snmallocheap.find_localalloc_addr()
             if localalloc_addr == 0:
                 info(f"Uninitialized LocalAlloc for thread {thread.num:d}")
                 continue
@@ -999,7 +1008,7 @@ class SnmallocHeapFreelistsCommand(GenericCommand):
             if thread.num not in tids:
                 continue
             thread.switch()
-            localalloc_addr = GefSnmallocHeapManager.find_localalloc_addr()
+            localalloc_addr = snmallocheap.find_localalloc_addr()
             if localalloc_addr == 0:
                 info(f"Uninitialized LocalAlloc for thread {thread.num:d}")
                 continue
