@@ -3,11 +3,9 @@
 # I am querying gdb for finding struct addresses for stability during snmalloc struct refactoring
 # Assumptions: snmalloc library with symbols (standard build)
 
-# TODO: account for customized configurations and PALs. Now it only works for Linux and the default config
 # TODO: exception handling (extremely lacking)
 # TODO: test on morello
 # TODO: test as a shim and as the main allocator
-# TODO: improve UX
 
 from __future__ import annotations
 from enum import Enum
@@ -37,10 +35,23 @@ def from_exp_mant(m_e: int, mantissa_bits: int, low_bits: int):
         return 1 << (m_e + low_bits)
 
 
-def ctz_const(x: int) -> int:
+def ctz(x: int) -> int:
     """Trailing zeros."""
     return (x & -x).bit_length() - 1
 
+
+def clz(x: int) -> int:
+    n = 0
+    for i in range(64-1, -1, -1):
+      mask = 1 << i
+      if (x & mask) == mask:
+          return n
+      n += 1
+    return n
+
+
+def next_pow2_bits(x: int) -> int:
+    return 64 - clz(x - 1)
 
 class MetaEntryConstants:
     REMOTE_BACKEND_MARKER = 1 << 7
@@ -60,6 +71,7 @@ class GefSnmallocHeapManager(GefManager):
         # base configurable constants. The remaining values are derived.
         self.__intermediate_bits = None # default 2
         self.__min_chunk_bits = None    # default 14
+        self.__min_object_count = None
         # not configurable but cached for performance
         self.__num_small_sizeclasses = None
         self.__sizeclass_tag = None
@@ -79,7 +91,7 @@ class GefSnmallocHeapManager(GefManager):
 
     @property
     def min_alloc_bits(self) -> int:
-        return ctz_const(self.min_alloc_size)
+        return ctz(self.min_alloc_size)
     
     @property
     def min_chunk_bits(self) -> int:
@@ -94,6 +106,12 @@ class GefSnmallocHeapManager(GefManager):
     @property
     def min_chunk_size(self) -> int:
         return 1 << self.min_chunk_bits
+    
+    @property
+    def min_object_count(self) -> int:
+        if not self.__min_object_count:
+            self.__min_object_count = parse_address("'snmalloc::MIN_OBJECT_COUNT'")
+        return self.__min_object_count
     
     @property
     def num_small_sizeclasses(self) -> int:
@@ -113,6 +131,7 @@ class GefSnmallocHeapManager(GefManager):
             try:
                 self.__pagemap_body = self.find_pagemap_body()
             except:
+                err("Couldn't find pagemap base!")
                 pass
         return self.__pagemap_body
     
@@ -121,14 +140,14 @@ class GefSnmallocHeapManager(GefManager):
         pagemap_body = parse_address(f"'{SNMALLOC_PAGEMAP}<{SNMALLOC_PAL}, {SNMALLOC_CONCRETE_PAGEMAP}<{self.min_chunk_bits}ul, {SNMALLOC_PAGEMAP_ENTRY}<{SNMALLOC_SLABMETADATA}>, {SNMALLOC_PAL}, {SNMALLOC_FLATPAGEMAP_HASBOUNDS}>, {SNMALLOC_PAGEMAP_ENTRY}<{SNMALLOC_SLABMETADATA}>, {SNMALLOC_BASICPAGEMAP_FIXEDRANGE}>::concretePagemap'->body")
         return pagemap_body
     
-    def find_localalloc_addr(self) -> Optional[int]:
+    def find_localalloc_addr(self) -> int:
         """Find the address of the current thread's LocalAlloc."""
         try:
             localalloc_addr = parse_address("&'snmalloc::ThreadAlloc::get()::alloc'")
         except gdb.error:
             # In binaries not linked with pthread...
             print("UNIMPLEMENTED")
-            pass
+            localalloc_addr = 0
         return localalloc_addr
     
     # TODO: INCOMPLETE, see sizeclasstable.h
@@ -176,6 +195,7 @@ snmallocheap = GefSnmallocHeapManager()
 class SnmallocChunkType(Enum):
     ALLOC = 0  # owned by the frontend
     CHUNK = 1  # owned by the backend
+    INVALID  = 3  # not associated with snmalloc
 
 
 class SnmallocChunkBase:
@@ -185,6 +205,7 @@ class SnmallocChunkBase:
         self.reset()
 
     def reset(self):
+        self.chunk_type = None
         self.__metaentry = None
         return
     
@@ -197,8 +218,16 @@ class SnmallocChunkBase:
             self.__metaentry = MetaEntry(metaentry_addr)
         return self.__metaentry
     
-    # TODO: is owned by backend or frontend? interpret Alloc or Chunk based on the metadata
-
+    def infer_chunk_type(self) -> SnmallocChunkType:
+        if self.chunk_type is not None:
+            return self.chunk_type
+        if self.metaentry.is_unowned():
+            return SnmallocChunkType.INVALID
+        elif self.metaentry.is_backend_owned():
+            return SnmallocChunkType.CHUNK
+        else:
+            return SnmallocChunkType.ALLOC
+    
 
 class SnmallocAlloc(SnmallocChunkBase):
     """Alloc structure owned by the frontend."""
@@ -212,6 +241,7 @@ class SnmallocAlloc(SnmallocChunkBase):
         self.__slabmeta = None
         self.__sc = None
         self.__size = None
+        self.__slab_mask = None
         return
     
     @property
@@ -235,11 +265,23 @@ class SnmallocAlloc(SnmallocChunkBase):
                 self.__size = snmallocheap.sizeclass_to_size(self.sc)
         return self.__size
     
+    @property
+    def slab_mask(self) -> int:
+        if not self.__slab_mask:
+            if self.slabmeta.large:
+                self.__slab_mask = self.size - 1
+            else:
+                slab_bits = max(snmallocheap.min_chunk_bits, next_pow2_bits(snmallocheap.min_object_count * self.size))
+                self.__slab_mask = (1 << slab_bits) - 1
+        return self.__slab_mask
+    
+    def start_of_object(self) -> int:
+        slab_start = self.address & ~self.slab_mask
+        offset = self.address & self.slab_mask
+        return slab_start + (offset // self.size) * self.size
+    
     def __str__(self) -> str:
-        return (f"{Color.colorify('Alloc', 'yellow bold underline')}(addr={self.address:#x}, "
-                f"large={self.slabmeta.large}, "
-                f"sc={self.sc:d}, size={self.size:#x}, "
-                f"remote={self.metaentry.remote:#x}, meta={self.metaentry.meta:#x})")
+        return (f"{Color.colorify('Alloc', 'yellow bold underline')}(addr={self.address:#x})")
 
 
 class SnmallocSmallBuddyChunk(SnmallocChunkBase):
@@ -464,7 +506,7 @@ class SlabMetadata:
         return self.__large
     
     def __str__(self) -> str:
-        return f"SlabMetadata[addr={self.address:#x}, needed={self.needed:d}, sleeping={self.sleeping}, large={self.large}]"
+        return f"SlabMetadata(addr={self.address:#x}, needed={self.needed:d}, sleeping={self.sleeping}, large={self.large})"
 
 
 class MetaEntry:
@@ -505,7 +547,7 @@ class MetaEntry:
         return ((self.meta == 0) or (self.meta == MetaEntryConstants.META_BOUNDARY_BIT)) and (self.ras == 0)
     
     def is_backend_owned(self) -> bool:
-        return (MetaEntryConstants.REMOTE_BACKEND_MARKER & MetaEntryConstants.remote_and_sizeclass) == MetaEntryConstants.REMOTE_BACKEND_MARKER
+        return (MetaEntryConstants.REMOTE_BACKEND_MARKER & self.ras) == MetaEntryConstants.REMOTE_BACKEND_MARKER
     
     @staticmethod
     def sizeof() -> int:
@@ -692,7 +734,7 @@ def print_localcache(thread, localalloc: LocalAlloc) -> None:
             msg.append(f"{RIGHT_ARROW} ... {RIGHT_ARROW} {chunk!s} ")
         if count == -1:
             msg.append("[Loop detected]")
-        gef_print(f"small_fast_free_lists[idx={i:d}, count={count}] ", end="")
+        gef_print(f"small_fast_free_lists[idx={i:d}, size={chunk.size:#x}, count={count}] ", end="")
         gef_print("".join(msg))
         gef_print("")
     return
@@ -706,22 +748,28 @@ def print_alloc_classes(thread, localalloc: LocalAlloc) -> None:
     no_active_slabs = True
     for i in range(snmallocheap.num_small_sizeclasses):
         slabmetacache = corealloc.alloc_classes[i]
-        allocs, count = slabmetacache.available.get_objects()
-        if count == 0:
+        slabmetas, slabmeta_count = slabmetacache.available.get_objects()
+        if slabmeta_count == 0:
             continue
         no_active_slabs = False
-        msg, limit = [], 5
-        for alloc in allocs[:limit-1]:
-            chunk = SlabMetadata(alloc)
-            msg.append(f"{RIGHT_ARROW} {chunk!s} ")
-        if len(allocs) > limit - 1:
-            chunk = SlabMetadata(allocs[-1])
-            msg.append(f"{RIGHT_ARROW} ... {RIGHT_ARROW} {chunk!s} ")
-        if count == -1:
-            msg.append("[Loop detected]")
-        gef_print(f"SlabMetadataCache[idx={i:d}, unused={slabmetacache.unused:d}, length={slabmetacache.length:d}] ", end="")
-        gef_print("".join(msg))
-        gef_print("")
+        gef_print(f"SlabMetadataCache[idx={i:d}, chunk_size={snmallocheap.sizeclass_to_size(i):#x}, unused={slabmetacache.unused:d}, length={slabmetacache.length:d}]: ")
+        for s in slabmetas:
+            slabmeta = SlabMetadata(s)
+            msg, limit = [], 5
+            objects, chunk_count = slabmeta.free_queue.get_objects()
+            for object in objects[:limit-1]:
+                chunk = SnmallocAlloc(object)
+                msg.append(f"{RIGHT_ARROW} {chunk!s} ")
+            if len(objects) > limit - 1:
+                chunk = SnmallocAlloc(objects[-1])
+                msg.append(f"{RIGHT_ARROW} ... {RIGHT_ARROW} {chunk!s} ")
+            if chunk_count == -1:
+                msg.append("[Loop detected]")
+            gef_print(f" |{RIGHT_ARROW} {slabmeta!s} (count={len(objects):d}) ", end="")
+            gef_print("".join(msg))
+            gef_print("")
+        if slabmeta_count == -1:
+            gef_print(f" |{RIGHT_ARROW} [Loop detected]")
     if no_active_slabs:
         info("No active slabs")
     return
@@ -748,10 +796,9 @@ def print_laden(thread, localalloc: LocalAlloc) -> None:
                 msg.append(f"{RIGHT_ARROW} ... {RIGHT_ARROW} {chunk!s} ")
             if count == -1:
                 msg.append("[Loop detected]")
-            gef_print(f"{slabmetadata!s} ")
+            gef_print(f"{slabmetadata!s} (count={len(objects):d}) ", end="")
             gef_print("".join(msg))
-            if count != 0:
-                gef_print("")
+            gef_print("")
     return
 
 
@@ -774,6 +821,33 @@ def print_remote_freelist(thread, localalloc: LocalAlloc) -> None:
         msg.append("[Loop detected]")
     gef_print("".join(msg))
     return
+
+
+def print_alloc_details(addr: int):
+    alloc = SnmallocAlloc(addr) # this works for any address under the same metaentry
+    slabmetadata = alloc.slabmeta
+    objects, count = slabmetadata.free_queue.get_objects()
+    msg, limit = [], 5
+    for object in objects[:limit-1]:
+        chunk = SnmallocAlloc(object)
+        msg.append(f"{RIGHT_ARROW} {chunk!s} ")
+    if count > limit - 1:
+        chunk = SnmallocAlloc(objects[-1])
+        msg.append(f"{RIGHT_ARROW} ... {RIGHT_ARROW} {chunk!s} ")
+    if count == -1:
+        msg.append("[Loop detected]")
+    gef_print(f"{alloc!s}")
+    # TODO: allocation status (in fast free lists, slab free lists, remote free list, or in use)
+    gef_print(f"Start of object: {alloc.start_of_object():#x}")
+    gef_print(f"Object size: {alloc.size:#x}")
+    gef_print(f"Offset into object: {(alloc.address - alloc.start_of_object()):#x}")
+    gef_print(f"Metaentry @ {alloc.metaentry.address:#x}")
+    gef_print(f"Associated slab details:")
+    gef_print(f"{slabmetadata!s} (count={len(objects):d}) ", end="")
+    if count == 0:
+        gef_print("")
+        info("Free list is empty")
+    else: gef_print("".join(msg))
 
 
 @register
@@ -907,26 +981,17 @@ class SnmallocHeapChunkCommand(GenericCommand):
 
         addr = parse_address(args.address)
         # get the slabmetadata
-        alloc = SnmallocAlloc(addr) # this works for any address under the same metaentry
-        info(f"Metaentry @ {alloc.metaentry.address:#x}")
-        info(f"Slab metadata @ {alloc.metaentry.meta:#x}")
-        slabmetadata = alloc.slabmeta
-        objects, count = slabmetadata.free_queue.get_objects()
-        msg, limit = [], 5
-        for object in objects[:limit-1]:
-            chunk = SnmallocAlloc(object)
-            msg.append(f"{RIGHT_ARROW} {chunk!s} ")
-        if count > limit - 1:
-            chunk = SnmallocAlloc(objects[-1])
-            msg.append(f"{RIGHT_ARROW} ... {RIGHT_ARROW} {chunk!s} ")
-        if count == -1:
-            msg.append("[Loop detected]")
-        gef_print(f"{alloc!s}")
-        gef_print(f"{slabmetadata!s} ", end="")
-        if count == 0:
-            gef_print("")
-            info("Free list is empty")
-        else: gef_print("".join(msg))
+        chunk_type = SnmallocChunkBase(addr).infer_chunk_type()
+        if chunk_type == SnmallocChunkType.ALLOC:
+            print_alloc_details(addr)
+        elif chunk_type == SnmallocChunkType.CHUNK:
+            chunk = SnmallocChunkBase(addr)
+            meta = chunk.metaentry.meta
+            if meta == 0:
+                gef_print(f"SmallBuddyChunk(addr={addr:#x})")
+            else:
+                gef_print(f"LargeBuddyChunk(addr={addr:#x})")
+            gef_print(f"Metaentry @ {chunk.metaentry.address:#x}")
         return
 
 
