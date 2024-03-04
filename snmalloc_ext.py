@@ -3,7 +3,6 @@
 # I am querying gdb for finding struct addresses for stability during snmalloc struct refactoring
 # Assumptions: snmalloc library with symbols (standard build)
 
-# TODO: refactor constants
 # TODO: account for customized configurations and PALs. Now it only works for Linux and the default config
 # TODO: exception handling (extremely lacking)
 # TODO: test on morello
@@ -12,48 +11,89 @@
 from __future__ import annotations
 from enum import Enum
 
-def from_exp_mant(m_e: int):
-    if GefSnmallocHeapManager.INTERMEDIATE_BITS > 0:
+def from_exp_mant(m_e: int, mantissa_bits: int, low_bits: int):
+    if mantissa_bits > 0:
         m_e = m_e + 1
-        mask = (1 << GefSnmallocHeapManager.INTERMEDIATE_BITS) - 1
+        mask = (1 << mantissa_bits) - 1
         m = m_e & mask
-        e = m_e >> GefSnmallocHeapManager.INTERMEDIATE_BITS
+        e = m_e >> mantissa_bits
         b = 0 if e == 0 else 1
         shifted_e = e - b
-        extended_m = (m + (b << GefSnmallocHeapManager.INTERMEDIATE_BITS))
-        return extended_m << (shifted_e + GefSnmallocHeapManager.MIN_ALLOC_BITS)
+        extended_m = (m + (b << mantissa_bits))
+        return extended_m << (shifted_e + low_bits)
     else:
-        return 1 << (m_e + GefSnmallocHeapManager.MIN_ALLOC_BITS)
+        return 1 << (m_e + low_bits)
+
+
+def ctz_const(x: int) -> int:
+    """Trailing zeros."""
+    return (x & -x).bit_length() - 1
+
+
+class MetaEntryConstants:
+    REMOTE_BACKEND_MARKER = 1 << 7
+    META_BOUNDARY_BIT = 1 << 0
+    REMOTE_WITH_BACKEND_MARKER_ALIGN = REMOTE_BACKEND_MARKER
+    BACKEND_RESERVED_MASK = (REMOTE_BACKEND_MARKER << 1) - 1
 
 
 class GefSnmallocHeapManager(GefManager):
     """Snmalloc heap manager."""
-    # configurable constants (TODO: read from gdb)
-    INTERMEDIATE_BITS = 2 # default
-    MIN_ALLOC_BITS = 4 # default
-    REMOTE_WITH_BACKEND_MARKER_ALIGN = 1 << 7
-    TAG = 0x40  # TODO: read from _ZN8snmalloc11sizeclass_t3TAGE
-    GRANULARITY_BIT = 14
-    METAENTRY_SIZE = 0x10
-
     def __init__(self) -> None:
         self.reset_caches()
         return
     
     def reset_caches(self) -> None:
         super().reset_caches()
-        self.NUM_SMALL_SIZECLASSES = None
+        # base configurable constants. The remaining values are derived.
+        self.__intermediate_bits = None # default 2
+        self.__min_chunk_bits = None    # default 14
+        # not configurable but cached for performance
+        self.__num_small_sizeclasses = None
+        self.__sizeclass_tag = None
+        # key base addresses
         self.__pagemap_body = None
         return
     
     @property
-    def num_small_sizeclasses(self) -> Optional[int]:
-        if not self.NUM_SMALL_SIZECLASSES:
-            try:
-                self.NUM_SMALL_SIZECLASSES = gdb.parse_and_eval("'snmalloc::NUM_SMALL_SIZECLASSES'")
-            except:
-                pass
-        return self.NUM_SMALL_SIZECLASSES
+    def intermediate_bits(self) -> int:
+        if not self.__intermediate_bits:
+            self.__intermediate_bits = parse_address("'snmalloc::INTERMEDIATE_BITS'")
+        return self.__intermediate_bits
+    
+    @property
+    def min_alloc_size(self) -> int:
+        return 2 * gef.arch.ptrsize
+
+    @property
+    def min_alloc_bits(self) -> int:
+        return ctz_const(self.min_alloc_size)
+    
+    @property
+    def min_chunk_bits(self) -> int:
+        if not self.__min_chunk_bits:
+            self.__min_chunk_bits = parse_address("'snmalloc::MIN_CHUNK_BITS'")
+        return self.__min_chunk_bits
+    
+    @property
+    def granularity_bit(self) -> int:
+        return self.min_chunk_bits
+    
+    @property
+    def min_chunk_size(self) -> int:
+        return 1 << self.min_chunk_bits
+    
+    @property
+    def num_small_sizeclasses(self) -> int:
+        if not self.__num_small_sizeclasses:
+            self.__num_small_sizeclasses = parse_address("'snmalloc::NUM_SMALL_SIZECLASSES'")
+        return self.__num_small_sizeclasses
+    
+    @property
+    def sizeclass_tag(self) -> int:
+        if not self.__sizeclass_tag:
+            self.__sizeclass_tag = parse_address("'snmalloc::sizeclass_t::TAG'")
+        return self.__sizeclass_tag
     
     @property
     def pagemap_body(self) -> Optional[int]:
@@ -68,72 +108,58 @@ class GefSnmallocHeapManager(GefManager):
     def find_pagemap_body() -> int:
         """Find the Pagemap body."""
         # TODO: coupled with Linux!
-        pagemap_body = parse_address("_ZN8snmalloc12BasicPagemapINS_8PALLinuxENS_11FlatPagemapILm14ENS_20DefaultPagemapEntryTINS_19DefaultSlabMetadataEEES1_Lb0EEES5_Lb0EE15concretePagemapE->body")
+        pagemap_body = parse_address("'snmalloc::BasicPagemap<snmalloc::PALLinux, snmalloc::FlatPagemap<14ul, snmalloc::DefaultPagemapEntryT<snmalloc::DefaultSlabMetadata>, snmalloc::PALLinux, false>, snmalloc::DefaultPagemapEntryT<snmalloc::DefaultSlabMetadata>, false>::concretePagemap'->body")
         return pagemap_body
     
     @staticmethod
-    def find_localalloc_addr() -> int:
+    def find_localalloc_addr() -> Optional[int]:
         """Find the address of the current thread's LocalAlloc."""
         try:
-            localalloc_addr = parse_address("&_ZZN8snmalloc11ThreadAlloc3getEvE5alloc")
+            localalloc_addr = parse_address("&'snmalloc::ThreadAlloc::get()::alloc'")
         except gdb.error:
             # In binaries not linked with pthread...
             print("UNIMPLEMENTED")
             pass
         return localalloc_addr
     
-    @staticmethod
-    def decode_ras(ras: int) -> Tuple[int, int]:
-        sizeclass = ras & (GefSnmallocHeapManager.REMOTE_WITH_BACKEND_MARKER_ALIGN - 1)
-        # remote = bits::align_down(ras, MetaEntry.REMOTE_WITH_BACKEND_MARKER_ALIGN)
-        remote = ras & ~(GefSnmallocHeapManager.REMOTE_WITH_BACKEND_MARKER_ALIGN - 1)
-        return remote, sizeclass
-    
     # TODO: INCOMPLETE, see sizeclasstable.h
-    @staticmethod
-    def from_small_class(sizeclass: int) -> int:
+    def from_small_class(self, sizeclass: int) -> int:
         """Convert from small sizeclass encoding to sizeclass encoding."""
-        return GefSnmallocHeapManager.TAG | sizeclass
+        return self.sizeclass_tag | sizeclass
     
-    @staticmethod
-    def from_large_class(sizeclass: int) -> int:
+    def from_large_class(self, sizeclass: int) -> int:
         """Convert from large sizeclass encoding to sizeclass encoding."""
         return sizeclass
     
-    @staticmethod
-    def as_small(sizeclass: int) -> int:
+    def as_small(self, sizeclass: int) -> int:
         """Convert from sizeclass encoding to small sizeclass encoding."""
-        return sizeclass & (GefSnmallocHeapManager.TAG - 1)
+        return sizeclass & (self.sizeclass_tag - 1)
     
-    @staticmethod
-    def as_large(sizeclass: int) -> int:
+    def as_large(self, sizeclass: int) -> int:
         """Convert from sizeclass encoding to large sizeclass encoding."""
-        return 64 - (sizeclass & (GefSnmallocHeapManager.TAG - 1))
+        return 64 - (sizeclass & (self.sizeclass_tag - 1))
     
-    @staticmethod
-    def sizeclass_to_size(sizeclass: int) -> int:
+    def sizeclass_to_size(self, sizeclass: int) -> int:
         """Convert from small sizeclass encoding to size."""
         # fast small
         # bits::from_exp_mant<INTERMEDIATE_BITS, MIN_ALLOC_BITS>(sizeclass);
-        return from_exp_mant(sizeclass)
+        return from_exp_mant(sizeclass, self.intermediate_bits, self.min_alloc_bits)
     
-    @staticmethod
-    def sizeclass_full_to_size(sizeclass: int) -> int:
+    def sizeclass_full_to_size(self, sizeclass: int) -> int:
         """Convert from sizeclass encoding to size."""
         assert(False)
         return
     
-    @staticmethod
-    def sizeclass_full_to_slab_size(sizeclass: int) -> int:
+    def sizeclass_full_to_slab_size(self, sizeclass: int) -> int:
         """Convert from sizeclass encoding to slab size."""
         assert(False)
     
-    @staticmethod
-    def sizeclass_to_slab_size(sizeclass: int) -> int:
+    def sizeclass_to_slab_size(self, sizeclass: int) -> int:
         """Convert from small sizeclass encoding to slab size."""
         assert(False)
 
-# initialize snmalloc heap manager
+
+# initialize snmalloc heap manager (with its own set of configurable constants)
 snmallocheap = GefSnmallocHeapManager()
 
 ## ALLOCATION
@@ -157,10 +183,12 @@ class SnmallocChunkBase:
     def metaentry(self) -> MetaEntry:
         if not self.__metaentry:
             # metaentry at pagemap.body + (p >> GRANULARITY_BIT) * METAENTRY_SIZE
-            idx = self.address >> GefSnmallocHeapManager.GRANULARITY_BIT
+            idx = self.address >> snmallocheap.granularity_bit
             metaentry_addr = snmallocheap.pagemap_body + idx * MetaEntry.sizeof()
             self.__metaentry = MetaEntry(metaentry_addr)
         return self.__metaentry
+    
+    # TODO: is owned by backend or frontend? interpret Alloc or Chunk based on the metadata
 
 
 class SnmallocAlloc(SnmallocChunkBase):
@@ -186,7 +214,7 @@ class SnmallocAlloc(SnmallocChunkBase):
     @property
     def sc(self) -> int:
         if not self.__sc:
-            self.__sc = GefSnmallocHeapManager.as_large(self.metaentry.sizeclass) if self.slabmeta.large else GefSnmallocHeapManager.as_small(self.metaentry.sizeclass)
+            self.__sc = snmallocheap.as_large(self.metaentry.sizeclass) if self.slabmeta.large else snmallocheap.as_small(self.metaentry.sizeclass)
         return self.__sc
     
     @property
@@ -195,7 +223,7 @@ class SnmallocAlloc(SnmallocChunkBase):
             if self.slabmeta.large:
                 self.__size = 1 << self.sc
             else:
-                self.__size = GefSnmallocHeapManager.sizeclass_to_size(self.sc)
+                self.__size = snmallocheap.sizeclass_to_size(self.sc)
         return self.__size
     
     def __str__(self) -> str:
@@ -246,7 +274,7 @@ class SeqSetNode:
     
     @staticmethod
     def sizeof() -> int:
-        return 0x10
+        return 2 * gef.arch.ptrsize
 
 
 class SeqSet:
@@ -411,19 +439,19 @@ class SlabMetadata:
     @property
     def needed(self) -> int:
         if not self.__needed:
-            self.__needed = int(gdb.parse_and_eval(f"(*('snmalloc::DefaultSlabMetadata'*){self.address})->needed_"))
+            self.__needed = parse_address(f"(*('snmalloc::DefaultSlabMetadata'*){self.address})->needed_")
         return self.__needed
     
     @property
     def sleeping(self) -> bool:
         if not self.__sleeping:
-            self.__sleeping = int(gdb.parse_and_eval(f"(*('snmalloc::DefaultSlabMetadata'*){self.address})->sleeping_")) != 0
+            self.__sleeping = parse_address(f"(*('snmalloc::DefaultSlabMetadata'*){self.address})->sleeping_") != 0
         return self.__sleeping
     
     @property
     def large(self) -> bool:
         if not self.__large:
-            self.__large = int(gdb.parse_and_eval(f"(*('snmalloc::DefaultSlabMetadata'*){self.address})->large_")) != 0
+            self.__large = parse_address(f"(*('snmalloc::DefaultSlabMetadata'*){self.address})->large_") != 0
         return self.__large
     
     def __str__(self) -> str:
@@ -455,13 +483,20 @@ class MetaEntry:
     
     @property
     def remote(self) -> int:
-        remote, _ = GefSnmallocHeapManager.decode_ras(self.ras)
+        remote = self.ras & ~(MetaEntryConstants.REMOTE_WITH_BACKEND_MARKER_ALIGN - 1)
         return remote
     
     @property
     def sizeclass(self) -> int:
-        _, sizeclass = GefSnmallocHeapManager.decode_ras(self.ras)
+        sizeclass = self.ras & (MetaEntryConstants.REMOTE_WITH_BACKEND_MARKER_ALIGN - 1)
         return sizeclass
+    
+    def is_unowned(self) -> bool:
+        """Not owned by either frontend or backend."""
+        return ((self.meta == 0) or (self.meta == MetaEntryConstants.META_BOUNDARY_BIT)) and (self.ras == 0)
+    
+    def is_backend_owned(self) -> bool:
+        return (MetaEntryConstants.REMOTE_BACKEND_MARKER & MetaEntryConstants.remote_and_sizeclass) == MetaEntryConstants.REMOTE_BACKEND_MARKER
     
     @staticmethod
     def sizeof() -> int:
@@ -841,7 +876,9 @@ class SnmallocHeapSlabsCommand(GenericCommand):
 
 @register
 class SnmallocHeapChunkCommand(GenericCommand):
-    """List details about the slab that owns the given heap address and its free list."""
+    """List details about the slab that owns the given heap address, if it is owned by the frontend.
+    If it is owned by the backend, make a best guess to identify the owning range and its representation.
+    TODO: it crashes for backend owned chunks."""
 
     _cmdline_ = "snheap chunk"
     _syntax_  = f"{_cmdline_} [-h] address"
@@ -862,6 +899,8 @@ class SnmallocHeapChunkCommand(GenericCommand):
         addr = parse_address(args.address)
         # get the slabmetadata
         alloc = SnmallocAlloc(addr) # this works for any address under the same metaentry
+        info(f"Metaentry @ {alloc.metaentry.address:#x}")
+        info(f"Slab metadata @ {alloc.metaentry.meta:#x}")
         slabmetadata = alloc.slabmeta
         objects, count = slabmetadata.free_queue.get_objects()
         msg, limit = [], 5
@@ -972,3 +1011,19 @@ class SnmallocHeapFreelistsCommand(GenericCommand):
 
         current_thread.switch()
         return
+
+@register
+class SnmallocHeapInfoCommand(GenericCommand):
+    """Print useful addresses."""
+
+    _cmdline_ = "snheap info"
+    _syntax_  = f"{_cmdline_} [-h]"
+
+    def __init__(self) -> None:
+        super().__init__(complete=gdb.COMPLETE_NONE)
+        return
+    
+    @only_if_gdb_running
+    def do_invoke(self, argv: List[str], **kwargs: Any) -> None:
+        pagemap_addr = snmallocheap.pagemap_body
+        gef_print(f"Pagemap body @ {pagemap_addr:#x}")
