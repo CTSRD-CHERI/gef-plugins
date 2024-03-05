@@ -4,6 +4,7 @@
 # TODO: exception handling (extremely lacking)
 # TODO: test on morello
 # TODO: test as a shim and as the main allocator
+# TODO: I hardcoded BITS (size of `size_t`) to 64
 
 from __future__ import annotations
 from enum import Enum
@@ -27,6 +28,12 @@ SNMALLOC_FLATPAGEMAP_HASBOUNDS = "false"
 SNMALLOC_BASICPAGEMAP_FIXEDRANGE = "false"
 SNMALLOC_CONFIG = "snmalloc::StandardConfig"  # XXXR3: there could be allocators of different configs within the same program?
 
+# default values in case they can't be queried in GDB
+SNMALLOC_INTERMEDIATE_BITS = 2
+SNMALLOC_MIN_CHUNK_BITS = 14 # 17 if in QEMU
+SNMALLOC_MIN_OBJECT_COUNT = 4 # mitigations(random_larger_thresholds) ? 13 : 4
+SNMALLOC_MAX_SMALL_SIZECLASS_BITS = 16 # 19 if in QEMU
+
 
 def from_exp_mant(m_e: int, mantissa_bits: int, low_bits: int):
     if mantissa_bits > 0:
@@ -40,6 +47,17 @@ def from_exp_mant(m_e: int, mantissa_bits: int, low_bits: int):
         return extended_m << (shifted_e + low_bits)
     else:
         return 1 << (m_e + low_bits)
+
+
+def to_exp_mant(val: int, mantissa_bits: int, low_bits: int):
+    size_mask = (1 << 64) - 1
+    leading_bit = (size_mask & (1 << (mantissa_bits + low_bits))) >> 1
+    mantissa_mask = (1 << mantissa_bits) - 1
+    val -= 1
+    e = 64 - mantissa_bits - low_bits - clz(val | leading_bit)
+    b = 0 if e == 0 else 1
+    m = (val >> (low_bits + e - b)) & mantissa_mask
+    return (e << mantissa_bits) + m 
 
 
 def ctz(x: int) -> int:
@@ -76,11 +94,13 @@ class GefSnmallocHeapManager(GefManager):
     def reset_caches(self) -> None:
         super().reset_caches()
         # base configurable constants. The remaining values are derived.
-        self.__intermediate_bits = None # default 2
-        self.__min_chunk_bits = None    # default 14
+        self.__intermediate_bits = None
+        self.__min_chunk_bits = None
         self.__min_object_count = None
+        self.__max_small_sizeclass_bits = None
         # not configurable but cached for performance
         self.__num_small_sizeclasses = None
+        self.__num_large_classes = None
         self.__sizeclass_tag = None
         # key base addresses
         self.__pagemap_body = None
@@ -89,7 +109,11 @@ class GefSnmallocHeapManager(GefManager):
     @property
     def intermediate_bits(self) -> int:
         if not self.__intermediate_bits:
-            self.__intermediate_bits = parse_address("'snmalloc::INTERMEDIATE_BITS'")
+            try:
+                self.__intermediate_bits = parse_address("'snmalloc::INTERMEDIATE_BITS'")
+            except gdb.error:
+                info("Using fallback hardcoded SNMALLOC_INTERMEDIATE_BITS")
+                self.__intermediate_bits = SNMALLOC_INTERMEDIATE_BITS
         return self.__intermediate_bits
     
     @property
@@ -103,7 +127,11 @@ class GefSnmallocHeapManager(GefManager):
     @property
     def min_chunk_bits(self) -> int:
         if not self.__min_chunk_bits:
-            self.__min_chunk_bits = parse_address("'snmalloc::MIN_CHUNK_BITS'")
+            try:
+                self.__min_chunk_bits = parse_address("'snmalloc::MIN_CHUNK_BITS'")
+            except gdb.error:
+                info("Using fallback hardcoded SNMALLOC_MIN_CHUNK_BITS")
+                self.__min_chunk_bits = SNMALLOC_MIN_CHUNK_BITS
         return self.__min_chunk_bits
     
     @property
@@ -117,19 +145,46 @@ class GefSnmallocHeapManager(GefManager):
     @property
     def min_object_count(self) -> int:
         if not self.__min_object_count:
-            self.__min_object_count = parse_address("'snmalloc::MIN_OBJECT_COUNT'")
+            try:
+                self.__min_object_count = parse_address("'snmalloc::MIN_OBJECT_COUNT'")
+            except gdb.error:
+                info("Using fallback hardcoded SNMALLOC_MIN_OBJECT_COUNT")
+                self.__min_object_count = SNMALLOC_MIN_OBJECT_COUNT
         return self.__min_object_count
+    
+    @property
+    def max_small_sizeclass_bits(self) -> int:
+        if not self.__max_small_sizeclass_bits:
+            try:
+                self.__max_small_sizeclass_bits = parse_address("'snmalloc::MAX_SMALL_SIZECLASS_BITS'")
+            except gdb.error:
+                info("Using fallback hardcoded SNMALLOC_MAX_SMALL_SIZECLASS_BITS")
+                self.__max_small_sizeclass_bits = SNMALLOC_MAX_SMALL_SIZECLASS_BITS
+            return self.__max_small_sizeclass_bits
     
     @property
     def num_small_sizeclasses(self) -> int:
         if not self.__num_small_sizeclasses:
-            self.__num_small_sizeclasses = parse_address("'snmalloc::NUM_SMALL_SIZECLASSES'")
+            try:
+                self.__num_small_sizeclasses = parse_address("'snmalloc::NUM_SMALL_SIZECLASSES'")
+            except gdb.error:
+                self.__num_small_sizeclasses = self.size_to_sizeclass(1 << self.max_small_sizeclass_bits)
         return self.__num_small_sizeclasses
+    
+    @property
+    def num_large_classes(self) -> int:
+        if not self.__num_large_classes:
+            self.__num_large_classes = 64 - self.max_small_sizeclass_bits
+        return self.__num_large_classes
     
     @property
     def sizeclass_tag(self) -> int:
         if not self.__sizeclass_tag:
-            self.__sizeclass_tag = parse_address("'snmalloc::sizeclass_t::TAG'")
+            try:
+                self.__sizeclass_tag = parse_address("'snmalloc::sizeclass_t::TAG'")
+            except gdb.error:
+                tag_sizeclass_bits = max(next_pow2_bits(self.num_small_sizeclasses + 1), next_pow2_bits(self.num_large_classes + 1))
+                self.__sizeclass_tag = 1 << tag_sizeclass_bits
         return self.__sizeclass_tag
     
     @property
@@ -139,6 +194,8 @@ class GefSnmallocHeapManager(GefManager):
                 self.__pagemap_body = self.find_pagemap_body()
             except:
                 err("Couldn't find pagemap base!")
+                pagemap_addr = self.find_pagemap_address()
+                self.__pagemap_body = int(dereference(pagemap_addr))
                 pass
         return self.__pagemap_body
     
@@ -147,14 +204,21 @@ class GefSnmallocHeapManager(GefManager):
         pagemap_body = parse_address(f"'{SNMALLOC_PAGEMAP}<{SNMALLOC_PAL}, {SNMALLOC_CONCRETE_PAGEMAP}<{self.min_chunk_bits}ul, {SNMALLOC_PAGEMAP_ENTRY}<{SNMALLOC_SLABMETADATA}>, {SNMALLOC_PAL}, {SNMALLOC_FLATPAGEMAP_HASBOUNDS}>, {SNMALLOC_PAGEMAP_ENTRY}<{SNMALLOC_SLABMETADATA}>, {SNMALLOC_BASICPAGEMAP_FIXEDRANGE}>::concretePagemap'->body")
         return pagemap_body
     
+    def find_pagemap_address(self) -> int:
+        # This is present even in Release builds
+        pagemap_addr = parse_address(f"&'{SNMALLOC_PAGEMAP}<{SNMALLOC_PAL}, {SNMALLOC_CONCRETE_PAGEMAP}<{self.min_chunk_bits}ul, {SNMALLOC_PAGEMAP_ENTRY}<{SNMALLOC_SLABMETADATA}>, {SNMALLOC_PAL}, {SNMALLOC_FLATPAGEMAP_HASBOUNDS}>, {SNMALLOC_PAGEMAP_ENTRY}<{SNMALLOC_SLABMETADATA}>, {SNMALLOC_BASICPAGEMAP_FIXEDRANGE}>::concretePagemap'")
+        return pagemap_addr
+    
     def find_localalloc_addr(self) -> int:
         """Find the address of the current thread's LocalAlloc."""
         try:
             localalloc_addr = parse_address("&'snmalloc::ThreadAlloc::get()::alloc'")
         except gdb.error:
             # In binaries not linked with pthread...
-            print("UNIMPLEMENTED")
-            localalloc_addr = 0
+            tpidr = parse_address("$ctpidr") # TODO: this is Morello
+            tls_base = int(dereference(tpidr))
+            localalloc_addr = int(dereference(tls_base + 0x30))
+            info(f"Guessed the LocalAlloc address to be {localalloc_addr:#x}")
         return localalloc_addr
     
     # TODO: INCOMPLETE, see sizeclasstable.h
@@ -192,6 +256,10 @@ class GefSnmallocHeapManager(GefManager):
     def sizeclass_to_slab_size(self, sizeclass: int) -> int:
         """Convert from small sizeclass encoding to slab size."""
         assert(False)
+
+    def size_to_sizeclass(self, size: int) -> int:
+        """Convert from size to small sizeclass encoding."""
+        return to_exp_mant(size, self.intermediate_bits, self.min_alloc_bits)
 
 
 # initialize snmalloc heap manager (with its own set of configurable constants)
@@ -703,7 +771,7 @@ class LocalAlloc:
             localcache_addr = parse_address(f"&(*('snmalloc::Alloc' *){hex(self.address)})->local_cache->small_fast_free_lists")
         except gdb.error:
             # In binaries not linked with pthread...
-            print("UNIMPLEMENTED")
+            err("UNIMPLEMENTED")
             pass
         return localcache_addr
 
@@ -712,7 +780,7 @@ class LocalAlloc:
             corealloc_addr = parse_address(f"(*('snmalloc::Alloc' *){hex(self.address)})->core_alloc")
         except gdb.error:
             # In binaries not linked with pthread
-            print("UNIMPLEMENTED")
+            err("UNIMPLEMENTED")
             pass
         return corealloc_addr
     
