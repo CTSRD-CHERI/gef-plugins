@@ -1,7 +1,5 @@
-
-# look for SNMALLOC_REQUIRE_CONSTINIT for variables with static or thread-local storage duration
-# I am querying gdb for finding struct addresses for stability during snmalloc struct refactoring
-# Assumptions: snmalloc library with symbols (standard build)
+# Assumptions:
+## snmalloc library is built with symbols (standard build)
 
 # TODO: exception handling (extremely lacking)
 # TODO: test on morello
@@ -10,8 +8,17 @@
 from __future__ import annotations
 from enum import Enum
 
+def default_pal(os_name: str) -> str:
+    if os_name == 'Linux':
+        return "snmalloc::PALLinux"
+    elif os_name == 'FreeBSD':
+        return "snmalloc::PALFreeBSD"
+    else:
+        err("Couldn't detect default_pal")
+        return "snmalloc::PALLinux"
+
 # strings to query in GDB
-SNMALLOC_PAL = "snmalloc::PALLinux"
+SNMALLOC_PAL = default_pal(platform.system())
 SNMALLOC_PAGEMAP = "snmalloc::BasicPagemap"
 SNMALLOC_CONCRETE_PAGEMAP = "snmalloc::FlatPagemap"
 SNMALLOC_PAGEMAP_ENTRY = "snmalloc::DefaultPagemapEntryT"
@@ -752,7 +759,7 @@ def print_alloc_classes(thread, localalloc: LocalAlloc) -> None:
         if slabmeta_count == 0:
             continue
         no_active_slabs = False
-        gef_print(f"SlabMetadataCache[idx={i:d}, chunk_size={snmallocheap.sizeclass_to_size(i):#x}, unused={slabmetacache.unused:d}, length={slabmetacache.length:d}]: ")
+        gef_print(f"SlabMetadataCache[idx={i:d}, alloc_size={snmallocheap.sizeclass_to_size(i):#x}, unused={slabmetacache.unused:d}, length={slabmetacache.length:d}]: ")
         for s in slabmetas:
             slabmeta = SlabMetadata(s)
             msg, limit = [], 5
