@@ -6,7 +6,7 @@ Prerequisite: [gef with CHERI support](https://github.com/CTSRD-CHERI/gef)
 
 ```sh
 # assuming this directory is named gef-plugins
-echo gef config gef.extra_plugins_dir gef-plugins >> ~/.gdbinit
+echo gef config gef.extra_plugins_dir /path/to/gef-plugins >> ~/.gdbinit
 ```
 
 ## Additions
