@@ -2,7 +2,6 @@
 ## snmalloc library is built with symbols (debug build)
 
 # TODO: exception handling (extremely lacking)
-# TODO: test on morello
 
 from __future__ import annotations
 from enum import Enum
@@ -60,7 +59,7 @@ def to_exp_mant(val: int, mantissa_bits: int, low_bits: int):
 
 def ctz(x: int) -> int:
     """Trailing zeros."""
-    x = (1 << gef.arch.adrsize) - 1
+    x = x & ((1 << gef.arch.adrsize) - 1)
     return (x & -x).bit_length() - 1
 
 
