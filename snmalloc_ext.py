@@ -1,10 +1,8 @@
 # Assumptions:
-## snmalloc library is built with symbols (standard build)
+## snmalloc library is built with symbols (debug build)
 
 # TODO: exception handling (extremely lacking)
 # TODO: test on morello
-# TODO: test as a shim and as the main allocator
-# TODO: I hardcoded BITS (size of `size_t`) to 64
 
 from __future__ import annotations
 from enum import Enum
@@ -50,11 +48,11 @@ def from_exp_mant(m_e: int, mantissa_bits: int, low_bits: int):
 
 
 def to_exp_mant(val: int, mantissa_bits: int, low_bits: int):
-    size_mask = (1 << 64) - 1
+    size_mask = (1 << gef.arch.adrsize) - 1
     leading_bit = (size_mask & (1 << (mantissa_bits + low_bits))) >> 1
     mantissa_mask = (1 << mantissa_bits) - 1
     val -= 1
-    e = 64 - mantissa_bits - low_bits - clz(val | leading_bit)
+    e = gef.arch.adrsize - mantissa_bits - low_bits - clz(val | leading_bit)
     b = 0 if e == 0 else 1
     m = (val >> (low_bits + e - b)) & mantissa_mask
     return (e << mantissa_bits) + m 
@@ -62,12 +60,13 @@ def to_exp_mant(val: int, mantissa_bits: int, low_bits: int):
 
 def ctz(x: int) -> int:
     """Trailing zeros."""
+    x = (1 << gef.arch.adrsize) - 1
     return (x & -x).bit_length() - 1
 
 
 def clz(x: int) -> int:
     n = 0
-    for i in range(64-1, -1, -1):
+    for i in range(gef.arch.adrsize-1, -1, -1):
       mask = 1 << i
       if (x & mask) == mask:
           return n
@@ -76,7 +75,7 @@ def clz(x: int) -> int:
 
 
 def next_pow2_bits(x: int) -> int:
-    return 64 - clz(x - 1)
+    return gef.arch.adrsize - clz(x - 1)
 
 class MetaEntryConstants:
     REMOTE_BACKEND_MARKER = 1 << 7
@@ -174,7 +173,7 @@ class GefSnmallocHeapManager(GefManager):
     @property
     def num_large_classes(self) -> int:
         if not self.__num_large_classes:
-            self.__num_large_classes = 64 - self.max_small_sizeclass_bits
+            self.__num_large_classes = gef.arch.adrsize - self.max_small_sizeclass_bits
         return self.__num_large_classes
     
     @property
@@ -209,15 +208,21 @@ class GefSnmallocHeapManager(GefManager):
         pagemap_addr = parse_address(f"&'{SNMALLOC_PAGEMAP}<{SNMALLOC_PAL}, {SNMALLOC_CONCRETE_PAGEMAP}<{self.min_chunk_bits}ul, {SNMALLOC_PAGEMAP_ENTRY}<{SNMALLOC_SLABMETADATA}>, {SNMALLOC_PAL}, {SNMALLOC_FLATPAGEMAP_HASBOUNDS}>, {SNMALLOC_PAGEMAP_ENTRY}<{SNMALLOC_SLABMETADATA}>, {SNMALLOC_BASICPAGEMAP_FIXEDRANGE}>::concretePagemap'")
         return pagemap_addr
     
-    def find_localalloc_addr(self) -> int:
+    def find_localalloc_addr(self) -> Optional[int]:
         """Find the address of the current thread's LocalAlloc."""
         try:
             localalloc_addr = parse_address("&'snmalloc::ThreadAlloc::get()::alloc'")
         except gdb.error:
             # In binaries not linked with pthread...
-            tpidr = parse_address("$ctpidr") # TODO: this is Morello
+            # Or when `Cannot find thread-local variables on this target` error pops
+            if is_aarch64() and is_cheri():
+                tpidr = parse_address("$ctpidr")
+            elif is_aarch64():
+                tpidr = parse_address("$tpidr")
+            else:
+                pass
             tls_base = int(dereference(tpidr))
-            localalloc_addr = int(dereference(tls_base + 0x30))
+            localalloc_addr = int(dereference(tls_base + 0x30)) # FIXME: this offset is hardcoded!
             info(f"Guessed the LocalAlloc address to be {localalloc_addr:#x}")
         return localalloc_addr
     
@@ -236,7 +241,7 @@ class GefSnmallocHeapManager(GefManager):
     
     def as_large(self, sizeclass: int) -> int:
         """Convert from sizeclass encoding to large sizeclass encoding."""
-        return 64 - (sizeclass & (self.sizeclass_tag - 1))
+        return gef.arch.adrsize - (sizeclass & (self.sizeclass_tag - 1))
     
     def sizeclass_to_size(self, sizeclass: int) -> int:
         """Convert from small sizeclass encoding to size."""
@@ -384,7 +389,7 @@ class SeqSetNode:
             try:
                 self.__next = int(dereference(self.address))
             except gdb.error:
-                print("UNIMPLEMENTED")
+                err("UNIMPLEMENTED")
                 pass
         return self.__next
 
@@ -394,7 +399,7 @@ class SeqSetNode:
             try:
                 self.__prev = int(dereference(self.address + gef.arch.ptrsize))
             except gdb.error:
-                print("UNIMPLEMENTED")
+                err("UNIMPLEMENTED")
                 pass
         return self.__prev
     
@@ -420,6 +425,8 @@ class SeqSet:
     
     def get_objects(self) -> Tuple[List[int], int]:
         """Return count -1 if loop is detected."""
+        if self.head.address == 0:
+            return [], 0
         ret = []
         visited = set()
         curr_node = self.head
@@ -430,6 +437,10 @@ class SeqSet:
                 return ret, -1
             curr_node = SeqSetNode(curr_node.next)
         return ret, len(ret)
+    
+    @staticmethod
+    def sizeof() -> int:
+        return SeqSetNode.sizeof()
 
 
 class SnmallocFreelistObject(SnmallocAlloc):
@@ -598,13 +609,13 @@ class MetaEntry:
     @property
     def ras(self) -> int:
         if not self.__ras:
-            self.__ras = u64(gef.memory.read(self.address + gef.arch.ptrsize, gef.arch.ptrsize)) # TODO: hardcoded pointer size, doesn't work on CHERI
+            self.__ras = int(dereference(self.address + gef.arch.ptrsize))
         return self.__ras
     
     @property
     def meta(self) -> int:
         if not self.__meta:
-            self.__meta = u64(gef.memory.read(self.address, gef.arch.ptrsize))
+            self.__meta = int(dereference(self.address))
         return self.__meta
     
     @property
@@ -685,7 +696,11 @@ class CoreAlloc:
         
         @staticmethod
         def sizeof() -> int:
-            return 0x18
+            try:
+                sz = parse_address("sizeof('snmalloc::CoreAllocator<snmalloc::StandardConfig>::SlabMetadataCache')")
+            except gdb.error:
+                sz = SeqSet.sizeof() + 0x10
+            return sz
 
     def __init__(self, addr: int):
         self.address = addr
@@ -705,8 +720,8 @@ class CoreAlloc:
                 for i in range(snmallocheap.num_small_sizeclasses):
                     cache_struct_base = array_base + i * self.SlabMetadataCache.sizeof()
                     head = SeqSet(cache_struct_base)
-                    unused = u16(gef.memory.read(cache_struct_base + 0x10, 2))
-                    length = u16(gef.memory.read(cache_struct_base + 0x10 + 0x4, 2))
+                    unused = u16(gef.memory.read(cache_struct_base + SeqSet.sizeof(), 2))
+                    length = u16(gef.memory.read(cache_struct_base + SeqSet.sizeof() + 0x4, 2))
                     cache_struct = self.SlabMetadataCache(head, unused, length)
                     self.__alloc_classes[i] = cache_struct
             except gdb.error:
