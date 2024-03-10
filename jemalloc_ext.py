@@ -103,7 +103,7 @@ class GefJemallocManager(GefManager):
             try:
                 addr = parse_address("tsd_get")
             except gdb.error:
-                addr = parse_address("__malloc")
+                addr = parse_address("&__malloc")
 
             func = gdb_disassemble(addr, count = attempts + 1)
             for i in range(attempts):
