@@ -8,7 +8,7 @@ Where can free chunks end up:
 - slab (small)
 - free extents (large, or small if their extent is freed)
 - free extents, coalesced
-- quarantine (in CheriBSD, if caprevoke is enabled)
+- quarantined (in CheriBSD, if caprevoke is enabled)
 '''
 
 from enum import Enum
@@ -238,60 +238,15 @@ class GefJemallocManager(GefManager):
     def max_tcache_idx(self):
         return int(gdb.parse_and_eval('__je_nhbins'))
     
-class GefHeapQuarantineManager(GefManager):
-    """Class managing heap quarantine."""
-    def __init__(self) -> None:
-        self.reset_caches()
-        return
-
-    def reset_caches(self) -> None:
-        super().reset_caches()
-        self.__read_chunks()
-        return
-
-    def __read_chunks(self) -> None:
-        self.__chunks = set() # Set of chunks in quarantine
-        self.__has_quarantine = False
-        try:
-            app_quarantine = gdb.parse_and_eval('application_quarantine')
-        except:
-            app_quarantine = None
-        if app_quarantine:
-            self.__has_quarantine = True
-            curr = app_quarantine['list']
-            while int(curr) != 0:
-                num_desc = curr['num_descriptors']
-                # for i in range(num_desc):
-                #     self.__chunks.add(int(curr['slab'][i]['ptr']))
-
-                # Single read optimisation
-                desc_sz = curr['slab'][0].type.sizeof
-                data = gef.memory.read(curr['slab'], num_desc * desc_sz)
-                self.__chunks = {
-                    u64(data[i * desc_sz:i * desc_sz + 8])
-                    for i in range(num_desc)
-                }
-                curr = curr['next']
-
-    @property
-    def chunks(self):
-        return self.__chunks
-
-    @property
-    def has_quarantine(self):
-        return self.__has_quarantine
-    
 
 jemalloc = GefJemallocManager()
-quarantine = GefHeapQuarantineManager()
 
 # Hooking
 orig_reset_fn = gef.heap.reset_caches
-def hooked_reset():
+def jemalloc_hooked_reset():
     jemalloc.reset_caches()
-    quarantine.reset_caches()
     orig_reset_fn()
-gef.heap.reset_caches = hooked_reset
+gef.heap.reset_caches = jemalloc_hooked_reset
 
 
 class JemallocChunk:
@@ -366,7 +321,7 @@ class JemallocChunk:
         return (bitmap & (1 << j)) != 0
     
     def get_chunk_status_(self):
-        if self.base_addr in quarantine.chunks:
+        if self.base_addr in gef.heap_caprevoke.chunks:
             return ChunkState.FREE_QUARANTINE
         if self.in_tcache():
             return ChunkState.FREE_TCACHE
@@ -420,7 +375,7 @@ class JemallocChunk:
         if self.__info['status'] == ChunkState.USED:
             pass
         else:
-            if quarantine.has_quarantine:
+            if gef.heap_caprevoke.has_quarantine:
                 msg.append(self.quarantine_msg())
             msg.append(self.tcache_msg())
         msg.append(self.extent_info())

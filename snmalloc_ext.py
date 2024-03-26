@@ -927,6 +927,7 @@ def print_alloc_details(addr: int):
         msg.append("[Loop detected]")
     gef_print(f"{alloc!s}")
     # TODO: allocation status (in fast free lists, slab free lists, remote free list, or in use)
+    gef_print(f"Object in quarantine: {bool(alloc.start_of_object() in gef.heap_caprevoke.chunks)}")
     gef_print(f"Start of object: {alloc.start_of_object():#x}")
     gef_print(f"Object size: {alloc.size:#x}")
     gef_print(f"Offset into object: {(alloc.address - alloc.start_of_object()):#x}")
@@ -1074,6 +1075,7 @@ class SnmallocHeapChunkCommand(GenericCommand):
         if chunk_type == SnmallocChunkType.ALLOC:
             print_alloc_details(addr)
         elif chunk_type == SnmallocChunkType.CHUNK:
+            # TODO: more detailed information
             chunk = SnmallocChunkBase(addr)
             meta = chunk.metaentry.meta
             if meta == 0:
