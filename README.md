@@ -17,6 +17,7 @@ echo gef config gef.extra_plugins_dir /path/to/gef-plugins >> ~/.gdbinit
     - `jheap uaf [noheap]`: scan for freed heap allocations that are pointed by valid capabilities in memory. Optionally, exclude capabilities stored in the heap.
 
 - Snmalloc heap manager: tested on https://github.com/microsoft/snmalloc
+    - `snheap info`: print pagemap address
     - `snheap localcache`: list entries in local cache `LocalCache` (also called small fast free lists)
     - `snheap slabs`: lists slabs in the core allocator (there can be multiple slabs per small size class, and large slabs)
     - `snheap remote`: lists the remote deallocation queue of the current of given thread(s)
@@ -28,6 +29,13 @@ echo gef config gef.extra_plugins_dir /path/to/gef-plugins >> ~/.gdbinit
     - `mrs chunk <address>`: query whether this chunk is owned by the allocator or quarantined. Also show shadow bitmap offset and value. The information we can query is limited because the capability load generation counter registers are not available to gdb in ring 3, so we can't inspect the kernel internal state of caprevoke unless debugging the kernel or using qemu.
     - `mrs quarantine`: print the quarantined chunks (and their shadow bit values of the allocation first word). 
 
+## Screenshots
+
+- Jemalloc heap manager: ![jheap-commands](./images/jheap-commands.png)
+
+- Snmalloc heap manager: ![snheap-commands](./images/snheap-commands.png)
+
+- Quarantine heap manager: ![mrs-commands](./images/mrs-commands.png)
 
 ## TODO
 
@@ -38,4 +46,4 @@ echo gef config gef.extra_plugins_dir /path/to/gef-plugins >> ~/.gdbinit
     - `snheap chunks`: list allocated `Chunk`s by parsing the metaentries in pagemap that correspond to chunks returned by the backend. The pipe of Ranges return `Arena`-bounded pointers, and the backend casts object allocation pointers to `Chunk`-bounded pointers and metadata pointers to the corresponding `SlabMetadata` pointer. 
     - `snheap smallbuddy`: display world view of the chunks owned by the small buddy range in the backend
     - `snheap largebuddy`: display world view of the chunks owned by the large buddy range in the backend
-    
+- Refactor: group jemalloc and snmalloc as heap manager options and override `gef.heap`.
